@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fontTools import subset
+from fontTools.pens.boundsPen import BoundsPen
+from fontTools.pens.transformPen import TransformPen
+from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.ttLib import TTFont
+from fontTools.varLib.instancer import instantiateVariableFont
 
 DEFAULT_VERSION = "3.1.0"
 UPSTREAM_REPO = "yuru7/PlemolJP"
@@ -24,6 +28,40 @@ VARIANT_PREFIXES = {
     "standard": "PlemolJP",
     "nf": "PlemolJP_NF",
     "hs": "PlemolJP_HS",
+}
+
+DEFAULT_PAPER_MONO_VERSION = "1.000"
+PAPER_MONO_REPO = "paper-design/paper-mono"
+KEYCAP_CODEPOINTS: tuple[int, ...] = (
+    0x21E7,  # ⇧ UPWARDS WHITE ARROW
+    0x2303,  # ⌃ UP ARROWHEAD
+    0x2318,  # ⌘ PLACE OF INTEREST SIGN
+    0x2325,  # ⌥ OPTION KEY
+    0x232B,  # ⌫ ERASE TO THE LEFT
+    0x238B,  # ⎋ BROKEN CIRCLE WITH NORTHWEST ARROW
+    0x23CE,  # ⏎ RETURN SYMBOL
+)
+
+# Weight compensation mapping for Paper Mono variable font scaled down to 1 cell.
+NARROW_CELL_WGHT_MAP: dict[int, int] = {
+    100: 220,
+    200: 320,
+    300: 480,
+    400: 700,
+    450: 740,
+    500: 770,
+    600: 800,
+    700: 800,
+}
+WIDE_CELL_WGHT_MAP: dict[int, int] = {
+    100: 200,
+    200: 280,
+    300: 420,
+    400: 620,
+    450: 680,
+    500: 730,
+    600: 780,
+    700: 800,
 }
 
 # Static Unicode ranges removed from PlemolJP:
@@ -47,12 +85,20 @@ KANA_RANGES: tuple[tuple[int, int], ...] = (
     (0xFF61, 0xFF9F),   # Halfwidth Katakana & Punctuation
 )
 
+PAPER_MONO_COPYRIGHT_MARKER = "[Paper Mono]"
+PAPER_MONO_COPYRIGHT_BLOCK = (
+    "\n\n[Paper Mono]\n"
+    "Copyright 2025 The Paper-Mono.Git Project Authors "
+    "(https://github.com/paper-design/paper-mono)"
+)
 DERIVED_COPYRIGHT_MARKER = "[PlemolNoHan]"
 DERIVED_COPYRIGHT_BLOCK = (
     "\n\n[PlemolNoHan]\n"
     "Copyright (c) 2026 Yeziii1210 (derived from PlemolJP)"
 )
 NAME_IDS_TO_RENAME = frozenset({1, 3, 4, 6, 16, 18, 21})
+
+_PAPER_MONO_CACHE: dict[tuple[int, int], TTFont] = {}
 
 
 @dataclass(frozen=True)
@@ -68,6 +114,7 @@ class BuildStats:
     removed_eaw_n_wide: int
     removed_eaw_a_wide: int
     removed_kana: int
+    patched_keycaps: int
 
 
 def is_pua(cp: int) -> bool:
@@ -93,15 +140,17 @@ def get_unicode_cmap(font: TTFont) -> dict[int, str]:
     return merged
 
 
-def rewrite_name_table(font: TTFont) -> None:
+def rewrite_name_table(font: TTFont, *, include_paper_mono: bool) -> None:
     """Update font name records while preserving upstream copyright notices verbatim."""
     for rec in font["name"].names:
         text = rec.toUnicode()
         if rec.nameID == 0:
+            extra_blocks = ""
+            if include_paper_mono and PAPER_MONO_COPYRIGHT_MARKER not in text:
+                extra_blocks += PAPER_MONO_COPYRIGHT_BLOCK
             if DERIVED_COPYRIGHT_MARKER not in text:
-                new_text = text.rstrip() + DERIVED_COPYRIGHT_BLOCK
-            else:
-                new_text = text
+                extra_blocks += DERIVED_COPYRIGHT_BLOCK
+            new_text = text.rstrip() + extra_blocks if extra_blocks else text
         elif rec.nameID in NAME_IDS_TO_RENAME:
             new_text = text.replace("PlemolJP", "PlemolNoHan")
         else:
@@ -118,7 +167,7 @@ def compute_drop_codepoints(
     *,
     strip_ambiguous_wide: bool,
     strip_kana: bool,
-) -> tuple[set[int], set[int], dict[str, int]]:
+) -> tuple[set[int], set[int], int, dict[str, int]]:
     """Determine which codepoints to keep and drop for a single font."""
     cmap = get_unicode_cmap(font)
     hmtx = font["hmtx"]
@@ -161,7 +210,7 @@ def compute_drop_codepoints(
                 counts["removed_eaw_a_wide"] += 1
 
     keep_cps = set(cmap.keys()) - drop_cps
-    return keep_cps, drop_cps, counts
+    return keep_cps, drop_cps, base_adv, counts
 
 
 def build_subset_options(font: TTFont) -> subset.Options:
@@ -208,6 +257,111 @@ def prune_dropped_from_cmap(font: TTFont, drop_cps: set[int]) -> None:
     cmap_table.tables = kept_tables
 
 
+def resolve_target_wght(font: TTFont, base_adv: int) -> int:
+    """Map target font weight class and cell width to compensated Paper Mono wght."""
+    weight_class = int(getattr(font["OS/2"], "usWeightClass", 400) or 400)
+    wght_map = NARROW_CELL_WGHT_MAP if base_adv <= 560 else WIDE_CELL_WGHT_MAP
+    closest = min(wght_map.keys(), key=lambda key: abs(key - weight_class))
+    return wght_map[closest]
+
+
+def get_paper_mono_instance(paper_mono_bytes: bytes, target_wght: int) -> TTFont:
+    """Return a cached Paper Mono variable font instance for target_wght."""
+    cache_key = (len(paper_mono_bytes), target_wght)
+    inst = _PAPER_MONO_CACHE.get(cache_key)
+    if inst is None:
+        base_font = TTFont(io.BytesIO(paper_mono_bytes))
+        inst = instantiateVariableFont(base_font, {"wght": target_wght}, inplace=True)
+        _PAPER_MONO_CACHE[cache_key] = inst
+    return inst
+
+
+def _measure_glyph_bounds(font: TTFont, codepoint: int) -> tuple[float, float, float, float]:
+    """Measure exact outline bounding box (x0, y0, x1, y1) for a codepoint."""
+    cmap = font.getBestCmap()
+    if not cmap or codepoint not in cmap:
+        raise ValueError(f"Source font missing keycap codepoint U+{codepoint:04X}")
+    glyph_set = font.getGlyphSet()
+    pen = BoundsPen(glyph_set)
+    glyph_set[cmap[codepoint]].draw(pen)
+    if pen.bounds is None:
+        raise ValueError(f"Empty outline for U+{codepoint:04X}")
+    return pen.bounds
+
+
+def inject_keycap_glyphs(
+    font: TTFont,
+    paper_inst_font: TTFont,
+    base_adv: int,
+) -> int:
+    """Embed 1-cell, weight-matched keycap glyphs from Paper Mono into font."""
+    cap_height = int(getattr(font["OS/2"], "sCapHeight", 677) or 677)
+    target_yc = cap_height / 2.0
+
+    paper_cmap = paper_inst_font.getBestCmap()
+    paper_glyph_set = paper_inst_font.getGlyphSet()
+    raw_bounds = {cp: _measure_glyph_bounds(paper_inst_font, cp) for cp in KEYCAP_CODEPOINTS}
+
+    ref_w = max(
+        raw_bounds[cp][2] - raw_bounds[cp][0]
+        for cp in (0x2318, 0x2325, 0x21E7)
+    )
+    cmd_y0, cmd_y1 = raw_bounds[0x2318][1], raw_bounds[0x2318][3]
+    ref_yc = (cmd_y0 + cmd_y1) / 2.0
+    scale = (0.84 * base_adv) / ref_w
+
+    cmap = get_unicode_cmap(font)
+    glyf_table = font["glyf"]
+    hmtx_table = font["hmtx"]
+    glyph_order = list(font.getGlyphOrder())
+    order_changed = False
+
+    gdef_class_defs = None
+    if "GDEF" in font and getattr(font["GDEF"].table, "GlyphClassDef", None) is not None:
+        gdef_class_defs = font["GDEF"].table.GlyphClassDef.classDefs
+
+    for cp in KEYCAP_CODEPOINTS:
+        x0, _, x1, _ = raw_bounds[cp]
+        g_scale = min(scale, (0.86 * base_adv) / (x1 - x0))
+        dx = (base_adv / 2.0) - g_scale * ((x0 + x1) / 2.0)
+        dy = target_yc - g_scale * ref_yc
+
+        tt_pen = TTGlyphPen(None)
+        transform_pen = TransformPen(tt_pen, (g_scale, 0.0, 0.0, g_scale, dx, dy))
+        paper_glyph_set[paper_cmap[cp]].draw(transform_pen)
+        new_glyph = tt_pen.glyph()
+
+        existing_gname = cmap.get(cp)
+        is_shared = existing_gname is not None and any(
+            u != cp and g == existing_gname for u, g in cmap.items()
+        )
+        if existing_gname is not None and not is_shared:
+            gname = existing_gname
+        else:
+            gname = f"uni{cp:04X}"
+            while gname in glyf_table or gname in glyph_order:
+                gname = f"{gname}_keycap"
+            glyph_order.append(gname)
+            order_changed = True
+
+        glyf_table[gname] = new_glyph
+        new_glyph.recalcBounds(glyf_table)
+        hmtx_table[gname] = (base_adv, int(new_glyph.xMin))
+
+        for table in font["cmap"].tables:
+            if table.isUnicode() and table.format in (4, 12):
+                table.cmap[cp] = gname
+        cmap[cp] = gname
+
+        if gdef_class_defs is not None:
+            gdef_class_defs[gname] = 1
+
+    if order_changed:
+        font.setGlyphOrder(glyph_order)
+
+    return len(KEYCAP_CODEPOINTS)
+
+
 def subset_font_bytes(
     font_bytes: bytes,
     rel_out_path: Path,
@@ -215,11 +369,12 @@ def subset_font_bytes(
     *,
     strip_ambiguous_wide: bool,
     strip_kana: bool,
+    paper_mono_bytes: bytes | None,
 ) -> BuildStats:
-    """Subset a single TTF byte buffer and write the resulting font file."""
+    """Subset a single TTF byte buffer, patch keycaps, and write the output font."""
     logging.getLogger("fontTools.subset").setLevel(logging.WARNING)
     font = TTFont(io.BytesIO(font_bytes))
-    keep_cps, drop_cps, counts = compute_drop_codepoints(
+    keep_cps, drop_cps, base_adv, counts = compute_drop_codepoints(
         font,
         strip_ambiguous_wide=strip_ambiguous_wide,
         strip_kana=strip_kana,
@@ -229,11 +384,19 @@ def subset_font_bytes(
     subsetter.populate(unicodes=sorted(keep_cps))
     subsetter.subset(font)
     prune_dropped_from_cmap(font, drop_cps)
-    rewrite_name_table(font)
+
+    patched_keycaps = 0
+    if paper_mono_bytes is not None:
+        target_wght = resolve_target_wght(font, base_adv)
+        paper_inst = get_paper_mono_instance(paper_mono_bytes, target_wght)
+        patched_keycaps = inject_keycap_glyphs(font, paper_inst, base_adv)
+
+    rewrite_name_table(font, include_paper_mono=paper_mono_bytes is not None)
 
     dest_path = output_dir / rel_out_path
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     font.save(dest_path)
+    kept_final = len(get_unicode_cmap(font))
     font.close()
 
     family_dir = rel_out_path.parent.as_posix() or "."
@@ -242,11 +405,12 @@ def subset_font_bytes(
         filename=rel_out_path.name,
         out_path=str(dest_path),
         original_cps=counts["original_cps"],
-        kept_cps=len(keep_cps),
+        kept_cps=kept_final,
         removed_static=counts["removed_static"],
         removed_eaw_n_wide=counts["removed_eaw_n_wide"],
         removed_eaw_a_wide=counts["removed_eaw_a_wide"],
         removed_kana=counts["removed_kana"],
+        patched_keycaps=patched_keycaps,
     )
 
 
@@ -257,6 +421,7 @@ def _worker_from_zip(
     output_dir: Path,
     strip_ambiguous_wide: bool,
     strip_kana: bool,
+    paper_mono_bytes: bytes | None,
 ) -> BuildStats:
     with zipfile.ZipFile(zip_path) as zf:
         data = zf.read(member)
@@ -266,6 +431,7 @@ def _worker_from_zip(
         output_dir,
         strip_ambiguous_wide=strip_ambiguous_wide,
         strip_kana=strip_kana,
+        paper_mono_bytes=paper_mono_bytes,
     )
 
 
@@ -275,6 +441,7 @@ def _worker_from_file(
     output_dir: Path,
     strip_ambiguous_wide: bool,
     strip_kana: bool,
+    paper_mono_bytes: bytes | None,
 ) -> BuildStats:
     return subset_font_bytes(
         src_path.read_bytes(),
@@ -282,6 +449,7 @@ def _worker_from_file(
         output_dir,
         strip_ambiguous_wide=strip_ambiguous_wide,
         strip_kana=strip_kana,
+        paper_mono_bytes=paper_mono_bytes,
     )
 
 
@@ -301,24 +469,46 @@ def strip_common_root(paths: list[Path]) -> list[Path]:
     return paths
 
 
-def download_upstream_zip(version: str, variant: str, cache_dir: Path) -> Path:
-    """Download the requested PlemolJP release zip into cache_dir if absent."""
-    prefix = VARIANT_PREFIXES[variant]
-    zip_name = f"{prefix}_v{version}.zip"
-    dest = cache_dir / zip_name
+def download_archive(url: str, dest: Path) -> Path:
+    """Download an archive to dest if not already cached."""
     if dest.exists() and dest.stat().st_size > 0:
-        print(f"Using cached upstream archive: {dest}")
+        print(f"Using cached archive: {dest}")
         return dest
 
-    url = f"https://github.com/{UPSTREAM_REPO}/releases/download/v{version}/{zip_name}"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".zip.part")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
     print(f"Downloading {url} -> {dest}")
     req = urllib.request.Request(url, headers={"User-Agent": "PlemolNoHan-Builder/0.1"})
     with urllib.request.urlopen(req) as resp, tmp.open("wb") as out:
         shutil.copyfileobj(resp, out)
     tmp.replace(dest)
     return dest
+
+
+def download_upstream_zip(version: str, variant: str, cache_dir: Path) -> Path:
+    """Download the requested PlemolJP release zip into cache_dir if absent."""
+    prefix = VARIANT_PREFIXES[variant]
+    zip_name = f"{prefix}_v{version}.zip"
+    url = f"https://github.com/{UPSTREAM_REPO}/releases/download/v{version}/{zip_name}"
+    return download_archive(url, cache_dir / zip_name)
+
+
+def download_paper_mono_zip(version: str, cache_dir: Path) -> Path:
+    """Download the Paper Mono release zip into cache_dir if absent."""
+    zip_name = f"paper-mono-v{version}.zip"
+    url = f"https://github.com/{PAPER_MONO_REPO}/releases/download/v{version}/{zip_name}"
+    return download_archive(url, cache_dir / zip_name)
+
+
+def load_paper_mono_var_bytes(zip_path: Path) -> bytes:
+    """Load PaperMono[wght].ttf bytes from the Paper Mono release archive."""
+    if not zip_path.is_file():
+        raise FileNotFoundError(f"Paper Mono zip not found: {zip_path}")
+    with zipfile.ZipFile(zip_path) as zf:
+        for member in zf.namelist():
+            if Path(member).name.lower() == "papermono[wght].ttf":
+                return zf.read(member)
+    raise FileNotFoundError(f"PaperMono[wght].ttf not found inside {zip_path}")
 
 
 def collect_jobs(args: argparse.Namespace) -> tuple[str, list[tuple[str | Path, Path]]]:
@@ -382,7 +572,8 @@ def print_summary(stats_list: list[BuildStats]) -> None:
             f"removed han/cjk={rep.removed_static}, "
             f"eaw_n_wide={rep.removed_eaw_n_wide}, "
             f"eaw_a_wide={rep.removed_eaw_a_wide}, "
-            f"kana={rep.removed_kana}"
+            f"kana={rep.removed_kana}, "
+            f"keycaps={rep.patched_keycaps}"
         )
     print(f"Total fonts built: {len(stats_list)}")
 
@@ -414,6 +605,22 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to an extracted directory of PlemolJP .ttf files (skips download)",
+    )
+    parser.add_argument(
+        "--paper-mono-version",
+        default=DEFAULT_PAPER_MONO_VERSION,
+        help=f"Paper Mono release version for macOS keycap icons (default: {DEFAULT_PAPER_MONO_VERSION})",
+    )
+    parser.add_argument(
+        "--paper-mono-zip",
+        type=Path,
+        default=None,
+        help="Path to an existing Paper Mono release zip (skips download)",
+    )
+    parser.add_argument(
+        "--no-keycap-patch",
+        action="store_true",
+        help="Disable embedding 1-cell macOS keycap icons from Paper Mono",
     )
     parser.add_argument(
         "--cache-dir",
@@ -454,6 +661,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     mode, jobs = collect_jobs(args)
+
+    paper_mono_bytes: bytes | None = None
+    if not args.no_keycap_patch:
+        paper_zip = (
+            args.paper_mono_zip.resolve()
+            if args.paper_mono_zip is not None
+            else download_paper_mono_zip(args.paper_mono_version, args.cache_dir)
+        )
+        paper_mono_bytes = load_paper_mono_var_bytes(paper_zip)
+
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -474,6 +691,7 @@ def main() -> int:
                         output_dir,
                         args.strip_ambiguous_wide,
                         args.strip_kana,
+                        paper_mono_bytes,
                     )
                 )
             else:
@@ -485,6 +703,7 @@ def main() -> int:
                         output_dir,
                         args.strip_ambiguous_wide,
                         args.strip_kana,
+                        paper_mono_bytes,
                     )
                 )
 

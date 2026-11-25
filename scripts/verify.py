@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify generated PlemolNoHan font files for glyph coverage, widths, and OFL names."""
+"""Verify generated PlemolNoHan font files for coverage, keycap metrics, and OFL names."""
 
 from __future__ import annotations
 
@@ -31,10 +31,20 @@ REQUIRED_CODEPOINTS: tuple[tuple[int, str], ...] = (
     (0x30A2, "KATAKANA LETTER A"),
 )
 
-FORBIDDEN_CODEPOINTS: tuple[tuple[int, str], ...] = (
+KEYCAP_CODEPOINTS: tuple[tuple[int, str], ...] = (
+    (0x21E7, "UPWARDS WHITE ARROW (Shift)"),
+    (0x2303, "UP ARROWHEAD (Control)"),
     (0x2318, "PLACE OF INTEREST SIGN (Command)"),
-    (0x23CE, "RETURN SYMBOL"),
+    (0x2325, "OPTION KEY (Option)"),
+    (0x232B, "ERASE TO THE LEFT (Delete)"),
+    (0x238B, "BROKEN CIRCLE WITH NORTHWEST ARROW (Escape)"),
+    (0x23CE, "RETURN SYMBOL (Return)"),
+)
+
+FORBIDDEN_CODEPOINTS: tuple[tuple[int, str], ...] = (
+    (0x2600, "BLACK SUN WITH RAYS"),
     (0x26A0, "WARNING SIGN"),
+    (0x2702, "BLACK SCISSORS"),
     (0x025B, "LATIN SMALL LETTER OPEN E"),
 )
 
@@ -64,6 +74,7 @@ def verify_font(path: Path) -> list[str]:
     try:
         cmap = merged_unicode_cmap(font)
         hmtx = font["hmtx"]
+        glyf = font["glyf"]
 
         # 1. Removed Han / CJK punctuation / Fullwidth ASCII ranges must be empty.
         leaked = [
@@ -85,29 +96,67 @@ def verify_font(path: Path) -> list[str]:
             if cp in cmap:
                 errors.append(f"Forbidden EAW=N wide codepoint still present: U+{cp:04X} ({label})")
 
-        if 0x0044 in cmap:
-            base_adv = hmtx[cmap[0x0044]][0]
-            wide_eaw_n = [
-                cp
-                for cp, gname in cmap.items()
-                if not is_pua(cp)
-                and hmtx[gname][0] > base_adv * 1.1
-                and unicodedata.east_asian_width(chr(cp)) == "N"
-            ]
-            if wide_eaw_n:
-                sample = ", ".join(f"U+{cp:04X}" for cp in sorted(wide_eaw_n)[:5])
+        if 0x0044 not in cmap:
+            errors.append("Missing reference glyph U+0044 ('D')")
+            return errors
+
+        base_adv = hmtx[cmap[0x0044]][0]
+        wide_eaw_n = [
+            cp
+            for cp, gname in cmap.items()
+            if not is_pua(cp)
+            and hmtx[gname][0] > base_adv * 1.1
+            and unicodedata.east_asian_width(chr(cp)) == "N"
+        ]
+        if wide_eaw_n:
+            sample = ", ".join(f"U+{cp:04X}" for cp in sorted(wide_eaw_n)[:5])
+            errors.append(
+                f"Found {len(wide_eaw_n)} non-PUA EAW=N wide glyph(s): {sample}"
+            )
+
+        # 4. Embedded 1-cell macOS keycap icons: presence, 1-cell advance, breathing margins, and alignment.
+        keycap_boxes: dict[int, tuple[int, int, int, int]] = {}
+        for cp, label in KEYCAP_CODEPOINTS:
+            if cp not in cmap:
+                errors.append(f"Missing embedded keycap U+{cp:04X} ({label})")
+                continue
+            gname = cmap[cp]
+            adv = hmtx[gname][0]
+            if adv != base_adv:
                 errors.append(
-                    f"Found {len(wide_eaw_n)} non-PUA EAW=N wide glyph(s): {sample}"
+                    f"Keycap U+{cp:04X} advance {adv} != base_adv {base_adv}"
+                )
+            glyph = glyf[gname]
+            if glyph.numberOfContours <= 0:
+                errors.append(f"Keycap U+{cp:04X} ({gname}) has empty/composite outline")
+                continue
+            if glyph.xMin < 25 or glyph.xMax > base_adv - 25:
+                errors.append(
+                    f"Keycap U+{cp:04X} tight/overflowing margins [{glyph.xMin}..{glyph.xMax}] in {base_adv} cell"
+                )
+            keycap_boxes[cp] = (glyph.xMin, glyph.yMin, glyph.xMax, glyph.yMax)
+
+        align_cps = (0x2318, 0x2325, 0x21E7)
+        if all(cp in keycap_boxes for cp in align_cps):
+            heights = [keycap_boxes[cp][3] - keycap_boxes[cp][1] for cp in align_cps]
+            ycs = [(keycap_boxes[cp][1] + keycap_boxes[cp][3]) / 2.0 for cp in align_cps]
+            if max(heights) - min(heights) > 25:
+                errors.append(
+                    f"Keycap heights (⌘/⌥/⇧) diverge by {max(heights) - min(heights)} > 25: {heights}"
+                )
+            if max(ycs) - min(ycs) > 10:
+                errors.append(
+                    f"Keycap vertical centers (⌘/⌥/⇧) diverge by {max(ycs) - min(ycs):.1f} > 10: {ycs}"
                 )
 
-        # 4. OFL name table compliance.
+        # 5. OFL name table compliance.
         names = font["name"].names
         copyright_records = [rec for rec in names if rec.nameID == 0]
         if not copyright_records:
             errors.append("Missing copyright record (nameID 0)")
         for rec in copyright_records:
             text = rec.toUnicode()
-            for required in ("Yuko Otawara", "IBM Corp.", "[PlemolNoHan]"):
+            for required in ("Paper-Mono", "Yuko Otawara", "IBM Corp.", "[PlemolNoHan]"):
                 if required not in text:
                     errors.append(
                         f"Copyright record (plat={rec.platformID}) missing {required!r}"
@@ -125,7 +174,7 @@ def verify_font(path: Path) -> list[str]:
                         f"nameID {rec.nameID} (plat={rec.platformID}) contains reserved name: {text!r}"
                     )
 
-        # 5. OpenType stylistic set UI names (nameID >= 256) preserved.
+        # 6. OpenType stylistic set UI names (nameID >= 256) preserved.
         ss_names = [rec.toUnicode() for rec in names if rec.nameID >= 256]
         if not ss_names:
             errors.append("Missing OpenType stylistic set UI names (nameID >= 256)")
