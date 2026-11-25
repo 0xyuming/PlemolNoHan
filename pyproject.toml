@@ -1,0 +1,13 @@
+[project]
+name = "plemol-no-han"
+version = "0.1.0"
+description = "PlemolJP subset with Han characters, CJK punctuation, and narrow-EAW double-width symbols removed"
+readme = "README.md"
+license = { text = "OFL-1.1" }
+requires-python = ">=3.11"
+dependencies = [
+    "fonttools>=4.50",
+]
+
+[tool.uv]
+package = false

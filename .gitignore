@@ -1,0 +1,8 @@
+.venv/
+.cache/
+dist/
+__pycache__/
+*.py[cod]
+*.ttf
+*.zip
+.DS_Store

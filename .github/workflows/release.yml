@@ -1,0 +1,71 @@
+name: Release PlemolNoHan
+
+on:
+  workflow_dispatch:
+    inputs:
+      plemoljp_version:
+        description: Upstream PlemolJP version to subset (without leading v)
+        required: true
+        default: "3.1.0"
+        type: string
+      variant:
+        description: Upstream PlemolJP archive variant
+        required: true
+        default: "standard"
+        type: choice
+        options:
+          - standard
+          - nf
+          - hs
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync Python environment
+        run: uv sync --frozen
+
+      - name: Build PlemolNoHan fonts
+        run: |
+          uv run python scripts/build.py \
+            --version "${{ inputs.plemoljp_version }}" \
+            --variant "${{ inputs.variant }}" \
+            --output-dir dist
+
+      - name: Verify generated fonts
+        run: uv run python scripts/verify.py --dir dist --expected-count 64
+
+      - name: Package release archive
+        env:
+          VERSION: ${{ inputs.plemoljp_version }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          cp LICENSE dist/LICENSE
+          if [ "$VARIANT" = "standard" ]; then
+            ARCHIVE="PlemolNoHan_v${VERSION}.zip"
+            TAG="v${VERSION}"
+          else
+            UPPER=$(echo "$VARIANT" | tr '[:lower:]' '[:upper:]')
+            ARCHIVE="PlemolNoHan_${UPPER}_v${VERSION}.zip"
+            TAG="v${VERSION}-${VARIANT}"
+          fi
+          (cd dist && zip -r "../${ARCHIVE}" .)
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: PlemolNoHan ${{ env.TAG }}
+          files: ${{ env.ARCHIVE }}
+          generate_release_notes: true
